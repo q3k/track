@@ -9,6 +9,7 @@ use winit::event::{ElementState};
 mod promod;
 mod notes;
 mod sound;
+mod synth;
 mod gui;
 mod input;
 
@@ -35,7 +36,7 @@ fn main() {
         s_level: 1.0,
         r: 0.1,
     }));
-    let wk = Arc::new(Mutex::new(sound::WaveformKind::Sine));
+    let wk = Arc::new(Mutex::new(synth::WaveformKind::Sine));
 
     let mut k = input::Keyboard::new();
     let pk = input::PianoKeyboard::new();
@@ -47,7 +48,7 @@ fn main() {
             let adsr = adsr.lock().unwrap();
             let wk = wk.lock().unwrap();
             let w = wk.new(note.freq());
-            let osc = sound::Oscillator::new(sr, w);
+            let osc = synth::Oscillator::new(sr, w);
             let env = sound::ADSR::new(&adsr);
             osc.envelope(env, sr)
         })
@@ -118,8 +119,8 @@ fn main() {
                 let mut wk = wk.lock().unwrap();
                 {
                     let mut wk2 = wk.clone();
-                    ui.radio_button("Sine", &mut wk2, sound::WaveformKind::Sine);
-                    ui.radio_button("Square", &mut wk2, sound::WaveformKind::Square);
+                    ui.radio_button("Sine", &mut wk2, synth::WaveformKind::Sine);
+                    ui.radio_button("Square", &mut wk2, synth::WaveformKind::Square);
                     *wk = wk2;
                 }
 
