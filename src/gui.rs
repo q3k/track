@@ -76,9 +76,12 @@ pub struct Filepicker {
 
 impl Filepicker {
     pub fn new() -> Self {
-        let root = std::path::PathBuf::from("/");
+        let path = match std::env::current_dir() {
+            Ok(p) => p,
+            Err(_) => std::path::PathBuf::from("/"),
+        };
         Self {
-            path: root,
+            path,
         }
     }
     pub fn draw(&mut self, ui: &imgui::Ui) -> Option<std::path::PathBuf> {

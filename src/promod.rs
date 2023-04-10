@@ -163,7 +163,10 @@ impl Data {
 
 #[derive(Debug)]
 pub enum Effect {
-    Unknown,
+    None,
+    Unknown {
+        val: u16,
+    },
     VolumeSlide {
         up: u8,
         down: u8,
@@ -190,6 +193,9 @@ pub enum Effect {
 
 impl Effect {
     pub fn from(v: u16) -> Self {
+        if v == 0 {
+            return Effect::None;
+        }
         let a = (v >> 8) & 0xf;
         let b = (v >> 4) & 0xf;
         let c = (v >> 0) & 0xf;
@@ -199,13 +205,9 @@ impl Effect {
             0xc => Effect::SetVolume { volume: z, },
             0xd => Effect::PatternBreak { division: (b * 10 + c) as usize, },
             0xe => match b {
-                0xa => Effect::FineVolumeSlideUp {
-                    up: c as u8,
-                },
-                0xb => Effect::FineVolumeSlideDown {
-                    down: c as u8,
-                },
-                _ => Effect::Unknown,
+                0xa => Effect::FineVolumeSlideUp { up: c as u8, },
+                0xb => Effect::FineVolumeSlideDown { down: c as u8, },
+                _ => Effect::Unknown { val: v, },
             },
             0xf => {
                 if z == 0 {
@@ -217,7 +219,21 @@ impl Effect {
                     Effect::SetBeatsPerMinute { bpm: z }
                 }
             },
-            _ => Effect::Unknown,
+            _ => Effect::Unknown { val: v, },
+        }
+    }
+
+    pub fn string(&self) -> String {
+        match self {
+            Effect::None => "...".into(),
+            Effect::VolumeSlide { up, down } => format!("A{:X}{:X}", up, down),
+            Effect::SetVolume { volume } => format!("C{:02X}", volume ),
+            Effect::PatternBreak { division } => format!("D{:02}", division),
+            Effect::FineVolumeSlideUp { up } => format!("EA{:X}", up),
+            Effect::FineVolumeSlideDown { down } => format!("EB{:X}", down),
+            Effect::SetTicksPerDivision { tpd } => format!("F{:02X}", tpd),
+            Effect::SetBeatsPerMinute { bpm } => format!("F{:02X}", bpm),
+            _ => "???".into(),
         }
     }
 }
@@ -238,7 +254,7 @@ impl Sample {
     fn parse_header<T: std::io::Read>(reader: &mut T) -> Result<Self> {
         let mut name = vec![0u8; 22];
         reader.read_exact(&mut name)?;
-        let name = std::str::from_utf8(&name).or(Err(Error::ParseError("invalid name")))?.trim_end_matches(char::from(0));
+        let name = std::str::from_utf8(&name).unwrap_or("????").trim_end_matches(char::from(0));
 
         let length = reader.read_u16::<BigEndian>()? as usize;
         let finetune = reader.read_u8()?;
@@ -365,7 +381,7 @@ impl <S: Signal<Sample=f32>> sound::Generator for SamplePlayback<S> {
 
 impl <S: Signal<Sample=f32>> sound::Enveloped for SamplePlayback<S> {
     fn trigger_start(&mut self) {
-        self.state = SamplePlaybackState::First { ix: 0 };
+        self.state = SamplePlaybackState::First { ix: 2 };
     }
     fn trigger_end(&mut self) {
         self.state = SamplePlaybackState::Stopped;

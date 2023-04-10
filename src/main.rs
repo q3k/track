@@ -7,7 +7,7 @@ use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
 use imgui_glium_renderer::Renderer;
 use imgui_winit_support::WinitPlatform;
 use winit::event::{ElementState};
-use imgui::Condition::Appearing;
+use imgui::Condition::{Appearing, FirstUseEver};
 
 mod promod;
 mod notes;
@@ -39,7 +39,7 @@ impl Synthesizer {
     }
 
     fn imgui_draw(&mut self, ui: &imgui::Ui) {
-        if imgui::CollapsingHeader::new("Synthesizer Options").default_open(true).build(ui) {
+        if imgui::CollapsingHeader::new("Synthesizer Options").default_open(false).build(ui) {
             ui.radio_button("Sine", &mut self.waveform_kind, synth::WaveformKind::Sine);
             ui.same_line();
             ui.radio_button("Square", &mut self.waveform_kind, synth::WaveformKind::Square);
@@ -113,10 +113,11 @@ impl Tracker {
             }
         }
     }
-    fn imgui_draw(&mut self, ui: &imgui::Ui) {
+    fn imgui_draw(&mut self, ui: &imgui::Ui) -> Option<usize> {
+        let mut res: Option<usize> = None;
         if let Some(player) = &self.player {
             let module = &player.module;
-            ui.window(format!("{} - Samples", module.title)).size([440.0, 900.0], Appearing).position([0.0, 100.0], Appearing)
+            ui.window(format!("{} - Samples", module.title)).size([440.0, 900.0], FirstUseEver).position([0.0, 300.0], FirstUseEver)
             .build(|| {
                 for (i, sample) in module.samples.iter().enumerate() {
                     let nbytes = sample.length * 2;
@@ -130,7 +131,7 @@ impl Tracker {
                         let id = ui.push_id(format!("sample {}", i));
                         gui::draw_sample(ui, &sample.data);
                         if ui.button("Play") {
-                            //*sp = Some(sample.clone());
+                            res = Some(i);
                         }
                         id.end();
                     }
@@ -141,7 +142,7 @@ impl Tracker {
                 self.selected_pattern = player.pattern;
             }
 
-            ui.window(format!("{} - Patterns", module.title)).size([600.0, 1300.0], Appearing).position([500.0, 0.0], Appearing).build(|| {
+            ui.window(format!("{} - Patterns", module.title)).size([390.0, 1250.0], FirstUseEver).position([500.0, 0.0], FirstUseEver).build(|| {
                 let items = (0..module.patterns.len()).collect::<Vec<usize>>();
                 let cur_row = player.row;
                 if let Some(_) = ui.begin_combo("Pattern", format!("{}", self.selected_pattern)) {
@@ -158,34 +159,54 @@ impl Tracker {
                     }
                 }
                 if self.selected_pattern < module.patterns.len() {
-                    for (i, row) in module.patterns[self.selected_pattern].rows.iter().enumerate() {
-                        let mut cur = "  ";
-                        if cur_row == i {
-                            cur = "->";
+                    let mut rowcol = imgui::TableColumnSetup::new("Row");
+                    rowcol.init_width_or_weight = 30.0;
+                    if let Some(_) = ui.begin_table_header_with_flags("Pattern", [
+                        rowcol,
+                        imgui::TableColumnSetup::new("1"),
+                        imgui::TableColumnSetup::new("2"),
+                        imgui::TableColumnSetup::new("3"),
+                        imgui::TableColumnSetup::new("4"),
+                    ], imgui::TableFlags::SIZING_FIXED_FIT) {
+                        for (i, row) in module.patterns[self.selected_pattern].rows.iter().enumerate() {
+                            ui.table_next_column();
+                            if cur_row == i {
+                                ui.table_set_bg_color(imgui::TableBgTarget::ROW_BG0, [0.2, 0.2, 0.2]);
+                            }
+                            ui.text(format!("{:02x}", i));
+                            for c in row.channels.iter() {
+                                let note = c.snote();
+                                let sn = c.sample_number();
+                                let sample = if sn == 0 {
+                                    format!("..")
+                                } else if sn < 16 {
+                                    format!(".{:X}", sn)
+                                } else {
+                                    format!("{:02X}", sn)
+                                };
+                                ui.table_next_column();
+                                ui.text_colored([1.0, 1.0, 1.0, 1.0], note);
+                                ui.same_line_with_spacing(0.0, 0.0);
+                                ui.text_colored([0.4, 0.7, 0.7, 1.0], sample);
+                                ui.same_line_with_spacing(0.0, 0.0);
+                                let effect = c.effect().string().chars().collect::<Vec<char>>();
+                                ui.text_colored([1.0, 0.5, 0.87, 1.0], format!("{}", effect[0]));
+                                ui.same_line_with_spacing(0.0, 0.0);
+                                ui.text_colored([1.0, 0.87, 0.5, 1.0], format!("{}{}   ", effect[1], effect[2]));
+                            }
                         }
-                        let row_data: Vec<String> = row.channels.iter().map(|c| {
-                            let note = c.snote();
-                            let sn = c.sample_number();
-                            let sample = if sn == 0 {
-                                format!("..")
-                            } else if sn < 16 {
-                                format!(".{:X}", sn)
-                            } else {
-                                format!("{:02X}", sn)
-                            };
-                            format!("{}{}....",  note, sample)
-                        }).collect();
-                        ui.text(format!("{}{:02x} | {}", cur, i, row_data.join(" | ")))
                     }
                 }
             });
         }
+
+        res
     }
 }
 
 #[derive(PartialEq,Eq,Clone,Copy)]
 enum LiveSoundSource {
-    Module,
+    Module(usize),
     Synthesizer,
 }
 
@@ -348,7 +369,15 @@ impl Application {
                 }
                 let mut sink = self.audio_sink.lock().unwrap();
                 match self.live_sound_source {
-                    LiveSoundSource::Module => (),
+                    LiveSoundSource::Module(ix) => {
+                        if let Some(p) = &sink.tracker.player {
+                            let sample = p.module.samples[ix].clone();
+                            let sample_rate = sink.sample_rate();
+                            sink.poly.set_notegen(Box::new(move |note| {
+                                Box::new(sample.clone().play(note, sample_rate))
+                            }));
+                        }
+                    },
                     LiveSoundSource::Synthesizer => {
                         let wk = self.synthesizer.waveform_kind.clone();
                         let sr = sink.sample_rate();
@@ -400,11 +429,23 @@ impl Application {
             ui.text("Live Play");
             ui.radio_button("Synthesizer", &mut self.live_sound_source, LiveSoundSource::Synthesizer);
             ui.same_line();
-            ui.radio_button("Module Sample", &mut self.live_sound_source, LiveSoundSource::Module);
+            match self.live_sound_source {
+                LiveSoundSource::Module(ix) => {
+                    ui.radio_button(format!("Module Sample {}", ix+1), &mut self.live_sound_source, LiveSoundSource::Module(ix));
+                }
+                _ => {
+                    ui.disabled(true, || {
+                        ui.radio_button_bool("Module Sample", false);
+                    });
+                },
+            }
             self.synthesizer.imgui_draw(ui);
             sink.tracker.imgui_draw_main_window(ui);
         });
-        sink.tracker.imgui_draw(ui);
+        let play_sample = sink.tracker.imgui_draw(ui);
+        if let Some(ix) = play_sample {
+            self.live_sound_source = LiveSoundSource::Module(ix);
+        }
     }
 }
 
