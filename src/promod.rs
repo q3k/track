@@ -1,5 +1,10 @@
 use std::io::Read;
+use std::sync::Arc;
+
 use byteorder::{BigEndian, ReadBytesExt};
+
+use crate::{notes, sound, sound::{Enveloped}};
+use crate::dsp::{Signal, Interpolator, Volume};
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,7 +28,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Module {
     pub title: String,
 
-    pub samples: Vec<Sample>,
+    pub samples: Vec<Arc<Sample>>,
+
+    pub patterns: Vec<Pattern>,
+
+    pub program: Vec<u8>,
 }
 
 impl Module {
@@ -48,29 +57,129 @@ impl Module {
 
         let mut ptable = vec![0u8; 128];
         f.read_exact(&mut ptable)?;
+        let ptable: Vec<u8> = Vec::from(ptable);
 
         let mut signature = vec![0u8; 4];
         f.read_exact(&mut signature)?;
 
         let npatterns = ptable.iter().max().unwrap() + 1;
+        let mut patterns: Vec<Pattern> = vec![];
         for _ in 0..npatterns {
-            let mut pattern = vec![0u8; 1024];
-            f.read_exact(&mut pattern)?;
+            let mut pattern = Pattern {
+                rows: vec![],
+            };
+
+            for _rid in 0..64 {
+                let mut row = Row {
+                    channels: vec![],
+                };
+                for _cid in 0..4 {
+                    let cell = f.read_u32::<BigEndian>()?;
+                    row.channels.push(Data(cell));
+                }
+                pattern.rows.push(row);
+            }
+            patterns.push(pattern);
         }
 
         for (i, sample) in samples.iter_mut().enumerate() {
-            for j in 0..(sample.data.len()) {
+            let mut data: Vec<i8> = vec![];
+            for _ in 0..(sample.data.len()) {
                 let v = f.read_i8().map_err(|e| {
                     Error::SampleError { sample: i, inner: Box::new(e.into()) }
                 })?;
-                sample.data[j] = v;
+                data.push(v);
             }
+            sample.set_data(data);
         }
 
         Ok(Self {
             title: title.into(),
-            samples,
+            samples: samples.into_iter().map(Arc::new).collect(),
+            patterns,
+            program: ptable,
         })
+    }
+}
+
+#[derive(Debug)]
+pub struct Pattern {
+    pub rows: Vec<Row>,
+}
+
+#[derive(Debug)]
+pub struct Row {
+    pub channels: Vec<Data>,
+}
+
+
+#[derive(Debug)]
+pub struct Data(u32);
+
+impl Data {
+    pub fn sample_number(&self) -> u8 {
+        let hi = (self.0 >> 28) & 0xF;
+        let lo = (self.0 >> 12) & 0xF;
+        return ((hi << 4) | lo) as u8;
+    }
+    pub fn period(&self) -> u16 {
+        ((self.0 >> 16) & 0xfff) as u16
+    }
+    pub fn snote(&self) -> String {
+        let mut period = self.period();
+        let mut oct = 1;
+        if period == 0 {
+            return "...".into()
+        }
+        if period  > 856 {
+            period /= 2;
+            oct = 0;
+        } else if period < 113 {
+            period *= 8;
+            oct = 4;
+        } else if period < 226 {
+            period *= 4;
+            oct = 3;
+        } else if period < 453 {
+            period *= 2;
+            oct = 2;
+        }
+        let mul = 856.0f32 / (period as f32);
+        let hs = (mul.log(1.0594630943592953f32) + 0.5).floor() as usize;
+        let notes: [&'static str; 12] = [
+            "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
+        ];
+        return format!("{}{}", notes[hs], oct+2);
+    }
+    pub fn effect(&self) -> Effect {
+        Effect::from((self.0 & 0xfff) as u16)
+    }
+    pub fn note(&self) -> notes::Note {
+        let period = self.period();
+        let freq = (440.0f32 * 254.0f32) / (period as f32);
+        notes::Note::new(freq)
+    }
+}
+
+#[derive(Debug)]
+pub enum Effect {
+    Unknown,
+    PatternBreak {
+        division: usize,
+    },
+}
+
+impl Effect {
+    pub fn from(v: u16) -> Self {
+        let a = (v >> 8) & 0xf;
+        let b = (v >> 4) & 0xf;
+        let c = (v >> 0) & 0xf;
+        match a {
+            0xd => Effect::PatternBreak {
+                division: (b * 10 + c) as usize,
+            },
+            _ => Effect::Unknown,
+        }
     }
 }
 
@@ -83,7 +192,7 @@ pub struct Sample {
     pub repeat_start: usize,
     pub repeat_length: usize,
 
-    pub data: Vec<i8>,
+    pub data: Vec<f32>,
 }
 
 impl Sample {
@@ -100,7 +209,235 @@ impl Sample {
         Ok(Self {
             name: name.into(),
             length, finetune, volume, repeat_start, repeat_length,
-            data: vec![0i8; length * 2],
+            data: vec![0.0f32; length * 2],
         })
+    }
+
+    fn set_data(&mut self, data: Vec<i8>) {
+        let converted = data.convert::<f32>();
+        self.data = converted.iter().collect();
+    }
+
+    pub fn play(self: Arc<Self>, note: notes::Note, sample_rate: u32) -> SamplePlayback<Volume<Interpolator<Arc<Self>>>> {
+        let diff = notes::A4.freq() / note.freq();
+        let from = (7093789.2f32 / (4.0f32 * 127.0f32)) / diff;
+        let to = sample_rate as f32;
+        let scale = to / from;
+        let length = (self.data.len() as f32) * scale;
+        let length = length as usize;
+
+        let mut repeat = None;
+        if self.repeat_length > 1 {
+            let r_start = (self.repeat_start as f32) * 2.0 * scale;
+            let r_start = std::cmp::min(r_start as usize, length);
+            let r_length = (self.repeat_length as f32) * 2.0 * scale;
+            let r_length = std::cmp::min(r_length as usize, length);
+            repeat = Some((r_start, r_length))
+        }
+
+
+        let resampled = self.clone().resample(length as usize);
+        let volume = resampled.volume(self.volume as f32 / 64.0);
+
+        SamplePlayback {
+            signal: volume,
+            repeat,
+            state: SamplePlaybackState::Stopped,
+        }
+    }
+}
+
+impl Signal for Arc<Sample> {
+    type Sample = f32;
+    fn length(&self) -> usize {
+        self.data.len()
+    }
+    fn get(&self, ix: usize) -> Self::Sample {
+        self.data[ix]
+    }
+}
+
+#[derive(Debug)]
+enum SamplePlaybackState {
+    Stopped,
+    First {
+        ix: usize,
+    },
+    Repeating {
+        ix: usize,
+    },
+}
+
+pub struct SamplePlayback<S: Signal> {
+    signal: S,
+    repeat: Option<(usize, usize)>,
+    state: SamplePlaybackState,
+}
+
+impl <S: Signal> SamplePlayback<S> {
+    fn _length(&self) -> usize {
+        if let Some((st, le)) = self.repeat {
+            return st + le;
+        }
+        self.signal.length()
+    }
+    fn _restart(&mut self) {
+        if let Some((st, _)) = self.repeat {
+            self.state = SamplePlaybackState::Repeating { ix: st };
+        } else {
+            self.state = SamplePlaybackState::Stopped;
+        }
+    }
+    fn _forward(&mut self) {
+        match self.state {
+            SamplePlaybackState::Stopped => (),
+            SamplePlaybackState::First { ix } => self.state = SamplePlaybackState::First { ix: ix + 1 },
+            SamplePlaybackState::Repeating { ix } => self.state = SamplePlaybackState::Repeating { ix: ix + 1 },
+        }
+    }
+    fn _ix(&self) -> usize {
+        match self.state {
+            SamplePlaybackState::Stopped => 0,
+            SamplePlaybackState::First { ix } => ix,
+            SamplePlaybackState::Repeating { ix } => ix,
+        }
+    }
+}
+
+impl <S: Signal<Sample=f32>> sound::Generator for SamplePlayback<S> {
+    fn next(&mut self) -> f32 {
+        if let SamplePlaybackState::Stopped = self.state {
+            return 0.0;
+        }
+
+        let ix = self._ix();
+        let length = self._length();
+        if ix >= length {
+            self._restart();
+        }
+        let val = self.signal.get(ix);
+        self._forward();
+
+        val
+    }
+}
+
+impl <S: Signal<Sample=f32>> sound::Enveloped for SamplePlayback<S> {
+    fn trigger_start(&mut self) {
+        self.state = SamplePlaybackState::First { ix: 0 };
+    }
+    fn trigger_end(&mut self) {
+        self.state = SamplePlaybackState::Stopped;
+    }
+
+}
+
+pub struct Player {
+    pub playing: bool,
+    pub module: Arc<Module>,
+    pub program: usize,
+    pub pattern: usize,
+    pub row: usize,
+    bpm: usize,
+    beat_left: usize,
+    sample_rate: u32,
+
+    incoming_break: Option<usize>,
+
+    channels: Vec<Option<Box<dyn sound::Generator + Send + Sync>>>,
+}
+
+impl Player {
+    pub fn new(module: &Arc<Module>, sample_rate: f32) -> Self {
+        let mut res = Self {
+            playing: false,
+            module: module.clone(),
+            program: 0,
+            pattern: 0,
+            row: 0,
+            bpm: 1016,
+            beat_left: 0,
+            sample_rate: sample_rate as u32,
+
+            incoming_break: None,
+
+            channels: vec![None, None, None, None],
+        };
+        res._beat_left_reset();
+        res._load_row();
+        res
+    }
+
+    fn _beat_left_reset(&mut self) {
+        self.beat_left = ((60.0 / (self.bpm as f32)) * (self.sample_rate as f32)) as usize;
+    }
+
+    fn _load_row(&mut self) {
+        for (i, c) in self.module.patterns[self.pattern].rows[self.row].channels.iter().enumerate() {
+            if c.period() == 0 || c.sample_number() == 0 {
+                continue
+            }
+            let sample = c.sample_number() as usize;
+            let mut sp = self.module.samples[sample-1].clone().play(c.note(), self.sample_rate);
+            sp.trigger_start();
+            self.channels[i] = Some(Box::new(sp));
+        }
+        log::info!("{}, {}", self.pattern, self.row);
+        self._apply_enter_effects();
+    }
+
+    fn _next(&mut self) {
+        self._beat_left_reset();
+        let (next_row, advance_pattern) = if let Some(d) = self.incoming_break {
+            self.incoming_break = None;
+            (d, true)
+        } else {
+            if self.row >= 63 {
+                (0, true)
+            } else {
+                (self.row+1, false)
+            }
+        };
+        self.row = next_row;
+        if advance_pattern {
+            self.program += 1;
+            if self.program >= self.module.program.len() {
+                self.program = 0;
+            }
+            self.pattern = self.module.program[self.program] as usize;
+        }
+        self._load_row();
+    }
+
+    fn _apply_enter_effects(&mut self) {
+        for c in self.module.patterns[self.pattern].rows[self.row].channels.iter() {
+            let effect = c.effect();
+            match effect {
+                Effect::PatternBreak { division }=> {
+                    self.incoming_break = Some(division);
+                },
+                _ => (),
+            }
+        }
+    }
+}
+
+impl sound::Generator for Player {
+    fn next(&mut self) -> f32 {
+        if self.playing == false {
+            return 0.0;
+        }
+        if self.beat_left == 0 {
+            self._next();
+        } else {
+            self.beat_left -= 1;
+        }
+        let mut v: f32 = 0.0;
+        for c in self.channels.iter_mut() {
+            if let Some(c) = c {
+                v += c.next() * 0.3;
+            }
+        }
+        v
     }
 }

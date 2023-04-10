@@ -1,15 +1,16 @@
 use std::{collections::BTreeMap};
 use crate::notes::{Note,NoteApprox};
 
-pub trait Generator: Sized {
+pub trait Generator {
     fn next(&mut self) -> f32;
 
-    fn envelope<E: Envelope>(self, e: E, sample_rate: u32) -> EnvelopedGenerator<Self, E> {
-        EnvelopedGenerator {
-            sample_rate: sample_rate as f32,
-            g: self,
-            e,
-        }
+}
+
+pub fn envelope<G: Generator, E:Envelope>(generator: G, envelope: E, sample_rate: u32) -> EnvelopedGenerator<G, E> {
+    EnvelopedGenerator {
+        sample_rate: sample_rate as f32,
+        g: generator,
+        e: envelope,
     }
 }
 
@@ -127,22 +128,28 @@ impl<G: Generator, E: Envelope> Enveloped for EnvelopedGenerator<G, E> {
     }
 }
 
-pub struct PolyphonicGenerator<E: Enveloped, F: Fn(Note) -> E> {
-    f: F,
+pub type DynEnveloped = Box<dyn Enveloped + Send + Sync>;
+pub type NoteGen = Box<dyn Fn(Note) -> DynEnveloped + Send + Sync>;
 
-    generators: BTreeMap<NoteApprox, E>,
+pub struct PolyphonicGenerator {
+    note_gen: Option<NoteGen>,
+    generators: BTreeMap<NoteApprox, DynEnveloped>,
     pub scopes: BTreeMap<NoteApprox, Vec<f32>>, 
     scope_ix: usize,
 }
 
-impl<E: Enveloped, F: Fn(Note) -> E> PolyphonicGenerator<E, F> {
-    pub fn new(f: F) -> Self {
+impl PolyphonicGenerator {
+    pub fn new() -> Self {
         Self {
-            f,
+            note_gen: None,
             generators: BTreeMap::new(),
             scopes: BTreeMap::new(),
             scope_ix: 0,
         }
+    }
+
+    pub fn set_notegen(&mut self, ng: NoteGen) {
+        self.note_gen = Some(ng);
     }
 
     pub fn start(&mut self, n: Note) {
@@ -154,8 +161,10 @@ impl<E: Enveloped, F: Fn(Note) -> E> PolyphonicGenerator<E, F> {
 
         self.scopes.insert(nap, vec![0.0; 512]);
 
-        let gen = (self.f)(n);
-        self.generators.entry(nap).or_insert(gen).trigger_start();
+        if let Some(f) = self.note_gen.as_ref() {
+            let gen = f(n);
+            self.generators.entry(nap).or_insert(gen).trigger_start();
+        }
     }
 
     pub fn stop(&mut self, n: Note) {
@@ -168,7 +177,7 @@ impl<E: Enveloped, F: Fn(Note) -> E> PolyphonicGenerator<E, F> {
     }
 }
 
-impl<E: Enveloped, F: Fn(Note) -> E> Generator for PolyphonicGenerator<E, F> {
+impl Generator for PolyphonicGenerator {
     fn next(&mut self) -> f32 {
         if self.scope_ix >= 512 {
             self.scope_ix = 0;
