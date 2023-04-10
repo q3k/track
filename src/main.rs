@@ -137,6 +137,10 @@ impl Tracker {
                 }
             });
 
+            if player.playing {
+                self.selected_pattern = player.pattern;
+            }
+
             ui.window(format!("{} - Patterns", module.title)).size([600.0, 1300.0], Appearing).position([500.0, 0.0], Appearing).build(|| {
                 let items = (0..module.patterns.len()).collect::<Vec<usize>>();
                 let cur_row = player.row;

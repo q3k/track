@@ -349,6 +349,20 @@ impl <S: Signal<Sample=f32>> sound::Enveloped for SamplePlayback<S> {
 
 }
 
+struct Channel {
+    generator: Option<Box<dyn sound::Generator + Send + Sync>>,
+    last_sample: Option<usize>,
+}
+
+impl Channel {
+    fn new() -> Self {
+        Self {
+            generator: None,
+            last_sample: None,
+        }
+    }
+}
+
 pub struct Player {
     pub playing: bool,
     pub module: Arc<Module>,
@@ -362,7 +376,7 @@ pub struct Player {
 
     incoming_break: Option<usize>,
 
-    channels: Vec<Option<Box<dyn sound::Generator + Send + Sync>>>,
+    channels: Vec<Channel>,
 }
 
 impl Player {
@@ -380,7 +394,7 @@ impl Player {
 
             incoming_break: None,
 
-            channels: vec![None, None, None, None],
+            channels: (0..4).map(|_| Channel::new()).collect(),
         };
         res._beat_left_reset();
         res._load_row();
@@ -397,13 +411,21 @@ impl Player {
 
     fn _load_row(&mut self) {
         for (i, c) in self.module.patterns[self.pattern].rows[self.row].channels.iter().enumerate() {
-            if c.period() == 0 || c.sample_number() == 0 {
+            if c.period() == 0 {
                 continue
             }
-            let sample = c.sample_number() as usize;
+            let mut sample = c.sample_number() as usize;
+            if sample == 0 {
+                sample = self.channels[i].last_sample.unwrap_or(0);
+            }
+            if sample == 0 {
+                continue
+            }
+
             let mut sp = self.module.samples[sample-1].clone().play(c.note(), self.sample_rate);
             sp.trigger_start();
-            self.channels[i] = Some(Box::new(sp));
+            self.channels[i].generator = Some(Box::new(sp));
+            self.channels[i].last_sample = Some(sample);
         }
         log::info!("{}, {}", self.pattern, self.row);
         self._apply_enter_effects();
@@ -463,8 +485,8 @@ impl sound::Generator for Player {
         }
         let mut v: f32 = 0.0;
         for c in self.channels.iter_mut() {
-            if let Some(c) = c {
-                v += c.next() * 0.3;
+            if let Some(g) = &mut c.generator {
+                v += g.next() * 0.3;
             }
         }
         v
