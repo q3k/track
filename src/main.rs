@@ -55,6 +55,7 @@ impl Synthesizer {
 struct Tracker {
     player: Option<promod::Player>,
     sample_rate: u32,
+    filepicker: Option<gui::Filepicker>,
 
     selected_pattern: usize,
 }
@@ -64,6 +65,7 @@ impl Tracker {
         Self {
             player: None,
             sample_rate,
+            filepicker: None,
 
             selected_pattern: 0,
         }
@@ -76,8 +78,9 @@ impl Tracker {
                 }
             } else {
                 if ui.button(format!("Load...")) {
-                    let m = Arc::new(promod::Module::load(std::path::Path::new("/home/q3k/Downloads/h0ffman_-_eon.mod")).unwrap());
-                    self.player = Some(promod::Player::new(&m, self.sample_rate as f32));
+                    if self.filepicker.is_none() {
+                        self.filepicker = Some(gui::Filepicker::new());
+                    }
                 }
             }
             if let Some(p) = &mut self.player{
@@ -98,6 +101,14 @@ impl Tracker {
                     if ui.button("Play") {
                         p.playing = true
                     }
+                }
+            }
+
+            if let Some(fp) = &mut self.filepicker {
+                if let Some(path) = fp.draw(ui) {
+                    self.filepicker = None;
+                    let m = Arc::new(promod::Module::load(&path).unwrap());
+                    self.player = Some(promod::Player::new(&m, self.sample_rate as f32));
                 }
             }
         }

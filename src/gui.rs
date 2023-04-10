@@ -69,3 +69,79 @@ pub fn create_window() -> (EventLoop<()>, glium::Display) {
 
     (event_loop, display)
 }
+
+pub struct Filepicker {
+    path: std::path::PathBuf,
+}
+
+impl Filepicker {
+    pub fn new() -> Self {
+        let root = std::path::PathBuf::from("/");
+        Self {
+            path: root,
+        }
+    }
+    pub fn draw(&mut self, ui: &imgui::Ui) -> Option<std::path::PathBuf> {
+        let mut found: Option<std::path::PathBuf> = None;
+        ui.window("Choose File").size([500.0, 300.0], imgui::Condition::Always).build(|| {
+            if ui.button("/") {
+                self.path = std::path::PathBuf::from("/");
+            }
+            ui.same_line();
+            if ui.button("..") {
+                self.path.pop();
+            }
+            ui.same_line();
+            ui.text(format!("Path: {}", self.path.to_str().unwrap_or("unk")));
+
+            let mut directories: Vec<(String, std::ffi::OsString)> = vec![];
+            let mut files: Vec<(String, std::ffi::OsString)> = vec![];
+            match std::fs::read_dir(&self.path) {
+                Err(e) => {
+                    ui.text(format!("Error: {}", e.to_string()));
+                }
+                Ok(l) => {
+                    for f in l {
+                        if let Ok(f) = f {
+                            let str: String = f.file_name().to_str().unwrap_or("???").into();
+                            if str.starts_with(".") {
+                                continue
+                            }
+                            let os_str = f.file_name();
+                            if let Ok(ftyp) = f.file_type() {
+                                if ftyp.is_dir() {
+                                    directories.push((format!("📁 {}", str), os_str));
+                                } else if ftyp.is_file() {
+                                    if str.to_ascii_lowercase().ends_with(".mod") {
+                                        files.push((str, os_str));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            directories.sort();
+            files.sort();
+            if let Some(_) = ui.begin_table_header("Files", [imgui::TableColumnSetup::new("Name")]) {
+                for (part, path) in directories.iter() {
+                    ui.table_next_column();
+                    ui.text(&part);
+                    if ui.is_item_clicked() {
+                        self.path.push(path);
+                    }
+                }
+                for (part, path) in files.iter() {
+                    ui.table_next_column();
+                    ui.text(&part);
+                    if ui.is_item_clicked() {
+                        let mut full_path = self.path.clone();
+                        full_path.push(path);
+                        found = Some(full_path);
+                    }
+                }
+            }
+        });
+        found
+    }
+}
