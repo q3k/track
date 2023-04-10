@@ -4,7 +4,7 @@ use std::sync::Arc;
 use byteorder::{BigEndian, ReadBytesExt};
 
 use crate::{notes, sound, sound::{Enveloped}};
-use crate::dsp::{Signal, Interpolator, Volume};
+use crate::dsp::{Signal, Interpolator};
 
 #[derive(Debug)]
 pub enum Error {
@@ -164,8 +164,21 @@ impl Data {
 #[derive(Debug)]
 pub enum Effect {
     Unknown,
+    VolumeSlide {
+        up: u8,
+        down: u8,
+    },
+    SetVolume {
+        volume: u16,
+    },
     PatternBreak {
         division: usize,
+    },
+    FineVolumeSlideUp {
+        up: u8,
+    },
+    FineVolumeSlideDown {
+        down: u8,
     },
     SetTicksPerDivision {
         tpd: u16,
@@ -180,12 +193,21 @@ impl Effect {
         let a = (v >> 8) & 0xf;
         let b = (v >> 4) & 0xf;
         let c = (v >> 0) & 0xf;
+        let mut z = b * 16 + c;
         match a {
-            0xd => Effect::PatternBreak {
-                division: (b * 10 + c) as usize,
+            0xa => Effect::VolumeSlide { up: b as u8, down: c as u8 },
+            0xc => Effect::SetVolume { volume: z, },
+            0xd => Effect::PatternBreak { division: (b * 10 + c) as usize, },
+            0xe => match b {
+                0xa => Effect::FineVolumeSlideUp {
+                    up: c as u8,
+                },
+                0xb => Effect::FineVolumeSlideDown {
+                    down: c as u8,
+                },
+                _ => Effect::Unknown,
             },
             0xf => {
-                let mut z = b * 16 + c;
                 if z == 0 {
                     z = 1;
                 }
@@ -235,7 +257,7 @@ impl Sample {
         self.data = converted.iter().collect();
     }
 
-    pub fn play(self: Arc<Self>, note: notes::Note, sample_rate: u32) -> SamplePlayback<Volume<Interpolator<Arc<Self>>>> {
+    pub fn play(self: Arc<Self>, note: notes::Note, sample_rate: u32) -> SamplePlayback<Interpolator<Arc<Self>>> {
         let diff = notes::A4.freq() / note.freq();
         let from = (7093789.2f32 / (4.0f32 * 127.0f32)) / diff;
         let to = sample_rate as f32;
@@ -254,10 +276,10 @@ impl Sample {
 
 
         let resampled = self.clone().resample(length as usize);
-        let volume = resampled.volume(self.volume as f32 / 64.0);
 
         SamplePlayback {
-            signal: volume,
+            signal: resampled,
+            volume: self.volume,
             repeat,
             state: SamplePlaybackState::Stopped,
         }
@@ -289,6 +311,7 @@ pub struct SamplePlayback<S: Signal> {
     signal: S,
     repeat: Option<(usize, usize)>,
     state: SamplePlaybackState,
+    volume: u8,
 }
 
 impl <S: Signal> SamplePlayback<S> {
@@ -334,8 +357,9 @@ impl <S: Signal<Sample=f32>> sound::Generator for SamplePlayback<S> {
         }
         let val = self.signal.get(ix);
         self._forward();
+        let volume = (self.volume as f32)/64.0;
 
-        val
+        val * volume
     }
 }
 
@@ -350,8 +374,9 @@ impl <S: Signal<Sample=f32>> sound::Enveloped for SamplePlayback<S> {
 }
 
 struct Channel {
-    generator: Option<Box<dyn sound::Generator + Send + Sync>>,
+    generator: Option<SamplePlayback<Interpolator<Arc<Sample>>>>,
     last_sample: Option<usize>,
+    volume_slide: Option<i8>,
 }
 
 impl Channel {
@@ -359,6 +384,7 @@ impl Channel {
         Self {
             generator: None,
             last_sample: None,
+            volume_slide: None,
         }
     }
 }
@@ -369,9 +395,13 @@ pub struct Player {
     pub program: usize,
     pub pattern: usize,
     pub row: usize,
+    tick: usize,
     native_tpd: u16,
     native_bpm: u16,
+
     division_left: usize,
+    tick_left: usize,
+
     sample_rate: u32,
 
     incoming_break: Option<usize>,
@@ -387,16 +417,19 @@ impl Player {
             program: 0,
             pattern: 0,
             row: 0,
+            tick: 0,
             native_tpd: 6,
             native_bpm: 125,
             division_left: 0,
+            tick_left: 0,
             sample_rate: sample_rate as u32,
 
             incoming_break: None,
 
             channels: (0..4).map(|_| Channel::new()).collect(),
         };
-        res._beat_left_reset();
+        res._division_left_reset();
+        res._tick_left_reset();
         res._load_row();
         res
     }
@@ -405,7 +438,13 @@ impl Player {
         (24.0 * (self.native_bpm as f32)) / (self.native_tpd as f32)
     }
 
-    fn _beat_left_reset(&mut self) {
+    fn _tick_left_reset(&mut self) {
+        let in_division = (60.0 / self._dpm()) * (self.sample_rate as f32);
+        let in_tick = in_division / (self.native_tpd as f32);
+        self.tick_left = in_tick as usize;
+    }
+
+    fn _division_left_reset(&mut self) {
         self.division_left = ((60.0 / self._dpm()) * (self.sample_rate as f32)) as usize;
     }
 
@@ -424,15 +463,19 @@ impl Player {
 
             let mut sp = self.module.samples[sample-1].clone().play(c.note(), self.sample_rate);
             sp.trigger_start();
-            self.channels[i].generator = Some(Box::new(sp));
+            self.channels[i].generator = Some(sp);
             self.channels[i].last_sample = Some(sample);
         }
+        for c in self.channels.iter_mut() {
+            c.volume_slide = None;
+        }
+        self.tick = 0;
         log::info!("{}, {}", self.pattern, self.row);
         self._apply_enter_effects();
     }
 
-    fn _next(&mut self) {
-        self._beat_left_reset();
+    fn _next_division(&mut self) {
+        self._division_left_reset();
         let (next_row, advance_pattern) = if let Some(d) = self.incoming_break {
             self.incoming_break = None;
             (d, true)
@@ -454,11 +497,42 @@ impl Player {
         self._load_row();
     }
 
+    fn _next_tick(&mut self) {
+        self._tick_left_reset();
+        if self.tick != 0 {
+            for c in self.channels.iter_mut() {
+                if let Some(slide) = c.volume_slide {
+                    if let Some(g) = &mut c.generator {
+                        let mut volume = g.volume as i32;
+                        let slide = slide as i32;
+                        volume += slide;
+                        if volume > 64 {
+                            volume = 64;
+                        }
+                        if volume < 0 {
+                            volume = 0;
+                        }
+                        g.volume = volume as u8;
+                    }
+                }
+            }
+        }
+        self.tick += 1;
+    }
+
     fn _apply_enter_effects(&mut self) {
-        for c in self.module.patterns[self.pattern].rows[self.row].channels.iter() {
+        for (i, c) in self.module.patterns[self.pattern].rows[self.row].channels.iter().enumerate() {
             let effect = c.effect();
             match effect {
-                Effect::PatternBreak { division }=> {
+                Effect::VolumeSlide { up, down } => {
+                    if up == 0 && down != 0 {
+                        self.channels[i].volume_slide = Some(-(down as i8));
+                    }
+                    if down == 0 && up != 0 {
+                        self.channels[i].volume_slide = Some(up as i8);
+                    }
+                },
+                Effect::PatternBreak { division } => {
                     self.incoming_break = Some(division);
                 },
                 Effect::SetBeatsPerMinute { bpm } => {
@@ -466,6 +540,31 @@ impl Player {
                 },
                 Effect::SetTicksPerDivision { tpd } => {
                     self.native_tpd = tpd;
+                }
+                Effect::SetVolume { volume } => {
+                    if let Some(v) = &mut self.channels[i].generator {
+                        v.volume = volume as u8;
+                        if v.volume > 64 {
+                            v.volume = 64;
+                        }
+                    }
+                }
+                Effect::FineVolumeSlideUp { up } => {
+                    if let Some(v) = &mut self.channels[i].generator {
+                        v.volume += up;
+                        if v.volume > 64 {
+                            v.volume = 64;
+                        }
+                    }
+                }
+                Effect::FineVolumeSlideDown { down } => {
+                    if let Some(v) = &mut self.channels[i].generator {
+                        if down > v.volume {
+                            v.volume = 0;
+                        } else {
+                            v.volume -= down;
+                        }
+                    }
                 }
                 _ => (),
             }
@@ -478,8 +577,13 @@ impl sound::Generator for Player {
         if self.playing == false {
             return 0.0;
         }
+        if self.tick_left == 0 {
+            self._next_tick();
+        } else {
+            self.tick_left -= 1;
+        }
         if self.division_left == 0 {
-            self._next();
+            self._next_division();
         } else {
             self.division_left -= 1;
         }
