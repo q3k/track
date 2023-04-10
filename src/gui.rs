@@ -23,7 +23,7 @@ pub fn imgui_init(display: &glium::Display) -> (imgui_winit_support::WinitPlatfo
         0x0020, 0xffff,
         0]); // this 0 is required to close the ranges list
     imgui_context.fonts().add_font(&[imgui::FontSource::TtfData {
-        data: include_bytes!("../Terminus.ttf"),
+        data: include_bytes!("../fonts/Terminus.ttf"),
         size_pixels: 14.0,
         config: Some(imgui::FontConfig {
             glyph_ranges: custom_ranges,

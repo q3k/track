@@ -1,0 +1,1 @@
+Terminus TTF is a TrueType version of Terminus Font, a fixed-width bitmap font optimized for long work with computers. See https://files.ax86.net/terminus-ttf/. It's [licenced under SIL Open Font License, version 1.1](http://scripts.sil.org/OFL).
