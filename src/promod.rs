@@ -376,6 +376,7 @@ impl <S: Signal<Sample=f32>> sound::Enveloped for SamplePlayback<S> {
 struct Channel {
     generator: Option<SamplePlayback<Interpolator<Arc<Sample>>>>,
     last_sample: Option<usize>,
+    last_note: Option<notes::Note>,
     volume_slide: Option<i8>,
 }
 
@@ -384,6 +385,7 @@ impl Channel {
         Self {
             generator: None,
             last_sample: None,
+            last_note: None,
             volume_slide: None,
         }
     }
@@ -450,9 +452,18 @@ impl Player {
 
     fn _load_row(&mut self) {
         for (i, c) in self.module.patterns[self.pattern].rows[self.row].channels.iter().enumerate() {
-            if c.period() == 0 {
+            if c.period() == 0 && c.sample_number() == 0 {
                 continue
             }
+            let note = if c.period() == 0 {
+                match self.channels[i].last_note {
+                    Some(n) => n,
+                    None => continue,
+                }
+            } else {
+                c.note()
+            };
+
             let mut sample = c.sample_number() as usize;
             if sample == 0 {
                 sample = self.channels[i].last_sample.unwrap_or(0);
@@ -461,10 +472,11 @@ impl Player {
                 continue
             }
 
-            let mut sp = self.module.samples[sample-1].clone().play(c.note(), self.sample_rate);
+            let mut sp = self.module.samples[sample-1].clone().play(note, self.sample_rate);
             sp.trigger_start();
             self.channels[i].generator = Some(sp);
             self.channels[i].last_sample = Some(sample);
+            self.channels[i].last_note = Some(note);
         }
         for c in self.channels.iter_mut() {
             c.volume_slide = None;
