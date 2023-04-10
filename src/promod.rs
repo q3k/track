@@ -167,6 +167,12 @@ pub enum Effect {
     PatternBreak {
         division: usize,
     },
+    SetTicksPerDivision {
+        tpd: u16,
+    },
+    SetBeatsPerMinute {
+        bpm: u16,
+    }
 }
 
 impl Effect {
@@ -177,6 +183,17 @@ impl Effect {
         match a {
             0xd => Effect::PatternBreak {
                 division: (b * 10 + c) as usize,
+            },
+            0xf => {
+                let mut z = b * 16 + c;
+                if z == 0 {
+                    z = 1;
+                }
+                if z <= 32 {
+                    Effect::SetTicksPerDivision { tpd: z }
+                } else {
+                    Effect::SetBeatsPerMinute { bpm: z }
+                }
             },
             _ => Effect::Unknown,
         }
@@ -338,8 +355,9 @@ pub struct Player {
     pub program: usize,
     pub pattern: usize,
     pub row: usize,
-    bpm: usize,
-    beat_left: usize,
+    native_tpd: u16,
+    native_bpm: u16,
+    division_left: usize,
     sample_rate: u32,
 
     incoming_break: Option<usize>,
@@ -355,8 +373,9 @@ impl Player {
             program: 0,
             pattern: 0,
             row: 0,
-            bpm: 1016,
-            beat_left: 0,
+            native_tpd: 6,
+            native_bpm: 125,
+            division_left: 0,
             sample_rate: sample_rate as u32,
 
             incoming_break: None,
@@ -368,8 +387,12 @@ impl Player {
         res
     }
 
+    fn _dpm(&self) -> f32 {
+        (24.0 * (self.native_bpm as f32)) / (self.native_tpd as f32)
+    }
+
     fn _beat_left_reset(&mut self) {
-        self.beat_left = ((60.0 / (self.bpm as f32)) * (self.sample_rate as f32)) as usize;
+        self.division_left = ((60.0 / self._dpm()) * (self.sample_rate as f32)) as usize;
     }
 
     fn _load_row(&mut self) {
@@ -416,6 +439,12 @@ impl Player {
                 Effect::PatternBreak { division }=> {
                     self.incoming_break = Some(division);
                 },
+                Effect::SetBeatsPerMinute { bpm } => {
+                    self.native_bpm = bpm;
+                },
+                Effect::SetTicksPerDivision { tpd } => {
+                    self.native_tpd = tpd;
+                }
                 _ => (),
             }
         }
@@ -427,10 +456,10 @@ impl sound::Generator for Player {
         if self.playing == false {
             return 0.0;
         }
-        if self.beat_left == 0 {
+        if self.division_left == 0 {
             self._next();
         } else {
-            self.beat_left -= 1;
+            self.division_left -= 1;
         }
         let mut v: f32 = 0.0;
         for c in self.channels.iter_mut() {
