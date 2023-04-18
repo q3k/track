@@ -222,8 +222,8 @@ impl AudioSink {
         let host = cpal::default_host();
         let device = host.default_output_device().expect("no output device available");
         log::info!("Audio device: {}", device.name().unwrap_or("UNKNOWN".into()));
-        let configs = device.supported_output_configs().expect("no output configs");
-        let config = configs.filter(|c| c.channels() == 2 && c.max_sample_rate().0 >= 44100 && c.sample_format() == cpal::SampleFormat::I16).next();
+        let config = AudioSink::get_config(&device, cpal::SampleFormat::F32)
+            .or_else(|| AudioSink::get_config(&device, cpal::SampleFormat::I16));
         let config = config.expect("no good audio config").with_sample_rate(cpal::SampleRate(44100));
         log::info!("Audio output config: {:?}", config);
 
@@ -235,6 +235,11 @@ impl AudioSink {
         }
     }
 
+    fn get_config(device: &cpal::Device, format: cpal::SampleFormat) -> Option<cpal::SupportedStreamConfigRange> {
+        let configs = device.supported_output_configs().expect("no output configs");
+        configs.filter(|c| c.channels() == 2 && c.max_sample_rate().0 >= 44100 && c.sample_format() == format).next()
+    }
+
     fn sample_rate(&self) -> u32 {
         self.config.sample_rate().0
     }
@@ -243,14 +248,15 @@ impl AudioSink {
         self.config.channels() as usize
     }
 
-    fn fill_sound_buffer(&mut self, data: &mut [i16], _info: &cpal::OutputCallbackInfo) {
+    fn fill_sound_buffer<T>(&mut self, data: &mut [T], mul: f32, _info: &cpal::OutputCallbackInfo)
+        where T: From<f32> {
         for frame in data.chunks_mut(self.channels()) {
             let v_p = self.poly.next();
             let v_t = self.tracker.player.as_mut().map(|p| p.next()).unwrap_or(0.0);
 
             let v = v_p + v_t;
             for sample in frame.iter_mut() {
-                *sample = (v * 32767.0) as i16;
+                *sample = T::from(mul * v);
             }
         }
     }
@@ -291,17 +297,36 @@ impl Application {
         let s = self.audio_sink.lock().unwrap();
         let config = s.config.clone();
         let audio_sink = self.audio_sink.clone();
-        let stream = s.device.build_output_stream(
-            &config.into(),
-            move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
-                let mut audio_sink = audio_sink.lock().unwrap();
-                audio_sink.fill_sound_buffer(data, info);
+        let stream = match s.config.sample_format() {
+            cpal::SampleFormat::F32 => {
+                s.device.build_output_stream(
+                    &config.into(),
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                        let mut audio_sink = audio_sink.lock().unwrap();
+                        audio_sink.fill_sound_buffer(data, 1.0, info);
+                    },
+                    move |err| {
+                        log::error!("Audio error: {:?}", err);
+                    },
+                    None
+                )
             },
-            move |err| {
-                log::error!("Audio error: {:?}", err);
+            cpal::SampleFormat::I16 => {
+                s.device.build_output_stream(
+                    &config.into(),
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                        let mut audio_sink = audio_sink.lock().unwrap();
+                        audio_sink.fill_sound_buffer(data, 32767.0, info);
+                    },
+                    move |err| {
+                        log::error!("Audio error: {:?}", err);
+                    },
+                    None
+                )
             },
-            None
-        ).unwrap();
+	    f => panic!("Unexpected sample format: {}", f)
+        }.unwrap();
+
         stream
     }
 
